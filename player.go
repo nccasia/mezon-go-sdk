@@ -24,19 +24,28 @@ var (
 )
 
 type streamingRTCConn struct {
-	peer *webrtc.PeerConnection
-	ws   stn.IWSConnection
+	stnWs stn.IWSConnection
 
 	clanId    string
 	channelId string
-	userId    string
-	username  string
 
 	// TODO: streaming video (#rapchieuphim)
 	// videoTrack *webrtc.TrackLocalStaticRTP
 	audioTrack *webrtc.TrackLocalStaticSample
+	audiences  map[string]*webrtc.PeerConnection
+
 	ctx        context.Context
 	cancelFunc context.CancelFunc
+}
+
+var config = webrtc.Configuration{
+	ICEServers: []webrtc.ICEServer{
+		{
+			URLs:       []string{"turn:turn.mezon.vn:5349", "stun:stun.l.google.com:19302"},
+			Username:   "turnmezon",
+			Credential: "QuTs4zUEcbylWemXL7MK",
+		},
+	},
 }
 
 type AudioPlayer interface {
@@ -46,21 +55,12 @@ type AudioPlayer interface {
 }
 
 func NewAudioPlayer(clanId, channelId, userId, username, token string) (AudioPlayer, error) {
-	wsConn, err := stn.NewWSConnection(&configs.Config{
-		BasePath:     "stn.mezon.vn",
+	stnConn, err := stn.NewWSConnection(&configs.Config{
+		BasePath:     "localhost:8081", //"stn.mezon.vn",
 		Timeout:      15,
 		InsecureSkip: true,
 		UseSSL:       false,
 	}, channelId, username, token)
-
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
-		},
-	}
-	peerConnection, err := webrtc.NewPeerConnection(config)
 	if err != nil {
 		return nil, err
 	}
@@ -80,82 +80,24 @@ func NewAudioPlayer(clanId, channelId, userId, username, token string) (AudioPla
 	if err != nil {
 		return nil, err
 	}
-	rtpSender, err := peerConnection.AddTrack(audioTrack)
-	if err != nil {
-		return nil, err
-	}
-
-	// Read incoming RTCP packets
-	// Before these packets are returned they are processed by interceptors. For things
-	// like NACK this needs to be called.
-	go func() {
-		rtcpBuf := make([]byte, 1500)
-		for {
-			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
-				return
-			}
-		}
-	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// save to store
 	rtcConnection := &streamingRTCConn{
-		peer:       peerConnection,
-		ws:         wsConn,
+		stnWs:      stnConn,
 		clanId:     clanId,
 		channelId:  channelId,
-		userId:     userId,
-		username:   username,
 		audioTrack: audioTrack,
 		ctx:        ctx,
 		cancelFunc: cancel,
 	}
 
 	// ws receive message handler ( on event )
-	wsConn.SetOnMessage(rtcConnection.OnWebsocketEvent)
+	stnConn.SetOnMessage(rtcConnection.OnWebsocketEvent)
 	MapStreamingRtcConn.Store(channelId, rtcConnection)
 
-	peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("Connection State has changed %s \n", state.String())
-
-		switch state {
-		case webrtc.ICEConnectionStateConnected:
-			// TODO: event ice connected
-			jsonData, _ := json.Marshal(map[string]string{"ChannelId": channelId})
-			wsConn.SendMessage(&stn.WsMsg{
-				ClanId:    clanId,
-				ChannelId: channelId,
-				Key:       "connect_publisher",
-				Value:     jsonData,
-				UserId:    userId,
-				Username:  username,
-			})
-		case webrtc.ICEConnectionStateClosed:
-			rtcConn, ok := MapStreamingRtcConn.Load(channelId)
-			if !ok {
-				return
-			}
-
-			if rtcConn.(*streamingRTCConn).peer == nil {
-				return
-			}
-
-			if rtcConn.(*streamingRTCConn).peer.ConnectionState() != webrtc.PeerConnectionStateClosed {
-				rtcConn.(*streamingRTCConn).peer.Close()
-			}
-
-			rtcConn.(*streamingRTCConn).cancel()
-
-			MapStreamingRtcConn.Delete(channelId)
-		}
-	})
-	peerConnection.OnICECandidate(func(i *webrtc.ICECandidate) {
-		rtcConnection.onICECandidate(i, channelId, clanId, userId, username)
-	})
-
-	// send offer
-	rtcConnection.sendOffer()
+	rtcConnection.audioTrack = audioTrack
 
 	return rtcConnection, nil
 }
@@ -166,12 +108,10 @@ func (c *streamingRTCConn) Close(channelId string) {
 		return
 	}
 
-	if rtcConn.(*streamingRTCConn).peer == nil {
-		return
-	}
-
-	if rtcConn.(*streamingRTCConn).peer.ConnectionState() != webrtc.PeerConnectionStateClosed {
-		rtcConn.(*streamingRTCConn).peer.Close()
+	for _, peer := range rtcConn.(*streamingRTCConn).audiences {
+		if peer != nil && peer.ConnectionState() != webrtc.PeerConnectionStateClosed {
+			peer.Close()
+		}
 	}
 	rtcConn.(*streamingRTCConn).cancel()
 
@@ -196,21 +136,18 @@ func (c *streamingRTCConn) cancel() {
 
 func (c *streamingRTCConn) OnWebsocketEvent(event *stn.WsMsg) error {
 
-	// TODO: fix hardcode
 	switch event.Key {
-	case "sd_answer":
-		// unzipData, _ := utils.GzipUncompress(eventData.JsonData)
-		// var answer webrtc.SessionDescription
-		var answerSDP string
-		err := json.Unmarshal(event.Value, &answerSDP)
+	case "session_subscriber":
+		// receive offer from subscriber
+		var offer webrtc.SessionDescription
+		err := json.Unmarshal(event.Value, &offer)
 		if err != nil {
 			return err
 		}
-
-		return c.peer.SetRemoteDescription(webrtc.SessionDescription{
-			Type: webrtc.SDPTypeAnswer,
-			SDP:  answerSDP,
-		})
+		_, err = c.createPeerConnection(&offer, event.ClientId)
+		if err != nil {
+			return err
+		}
 
 	case "ice_candidate":
 
@@ -220,35 +157,32 @@ func (c *streamingRTCConn) OnWebsocketEvent(event *stn.WsMsg) error {
 			return err
 		}
 
-		return c.addICECandidate(i)
+		return c.addICECandidate(i, event.ClientId)
 	}
 
 	return nil
 }
 
-func (c *streamingRTCConn) sendOffer() error {
-	offer, err := c.peer.CreateOffer(nil)
+func (c *streamingRTCConn) sendAnswer(pc *webrtc.PeerConnection) error {
+	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		return err
 	}
-	if err := c.peer.SetLocalDescription(offer); err != nil {
+	if err := pc.SetLocalDescription(answer); err != nil {
 		return err
 	}
 
-	byteJson, _ := json.Marshal(offer)
+	byteJson, _ := json.Marshal(answer)
 
-	// send socket signaling, gzip compress data
-	return c.ws.SendMessage(&stn.WsMsg{
-		Key:       "session_publisher",
+	return c.stnWs.SendMessage(&stn.WsMsg{
+		Key:       "sd_answer",
 		ClanId:    c.clanId,
 		ChannelId: c.channelId,
-		UserId:    c.userId,
-		Username:  c.username,
 		Value:     byteJson,
 	})
 }
 
-func (c *streamingRTCConn) onICECandidate(i *webrtc.ICECandidate, clanId, channelId, userId, username string) error {
+func (c *streamingRTCConn) onICECandidate(i *webrtc.ICECandidate, clanId, channelId, clientId string) error {
 	if i == nil {
 		return nil
 	}
@@ -259,18 +193,21 @@ func (c *streamingRTCConn) onICECandidate(i *webrtc.ICECandidate, clanId, channe
 		return err
 	}
 
-	return c.ws.SendMessage(&stn.WsMsg{
+	return c.stnWs.SendMessage(&stn.WsMsg{
 		Key:       "ice_candidate",
 		Value:     candidateString,
 		ClanId:    clanId,
 		ChannelId: channelId,
-		UserId:    userId,
-		Username:  username,
+		ClientId:  clientId,
 	})
 }
 
-func (c *streamingRTCConn) addICECandidate(i webrtc.ICECandidateInit) error {
-	return c.peer.AddICECandidate(i)
+func (c *streamingRTCConn) addICECandidate(i webrtc.ICECandidateInit, clientId string) error {
+	var err error
+	if peer, ok := c.audiences[clientId]; ok {
+		err = peer.AddICECandidate(i)
+	}
+	return err
 }
 
 func (c *streamingRTCConn) Play(filePath string) error {
@@ -324,4 +261,53 @@ func (c *streamingRTCConn) Play(filePath string) error {
 			}
 		}
 	}
+}
+
+func (c *streamingRTCConn) createPeerConnection(offer *webrtc.SessionDescription, clientId string) (*webrtc.PeerConnection, error) {
+	pc, err := webrtc.NewPeerConnection(config)
+	if err != nil {
+		return nil, err
+	}
+	if err := pc.SetRemoteDescription(*offer); err != nil {
+		return nil, err
+	}
+	rtpSender, err := pc.AddTrack(c.audioTrack)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read incoming RTCP packets
+	// Before these packets are returned they are processed by interceptors. For things
+	// like NACK this needs to be called.
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
+
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		log.Printf("Connection State has changed %s \n", state.String())
+
+		switch state {
+		case webrtc.ICEConnectionStateConnected, webrtc.ICEConnectionStateClosed:
+			c.stnWs.SendMessage(&stn.WsMsg{
+				ClanId:    c.clanId,
+				ChannelId: c.channelId,
+				Key:       "session_state_changed",
+				ClientId:  clientId,
+				State:     int(state),
+			})
+		}
+	})
+
+	pc.OnICECandidate(func(i *webrtc.ICECandidate) {
+		c.onICECandidate(i, c.channelId, c.clanId, clientId)
+	})
+
+	c.sendAnswer(pc)
+
+	return pc, nil
 }
